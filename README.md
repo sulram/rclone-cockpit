@@ -8,6 +8,24 @@ interactively.
 Built for a multi-cloud setup (2 Google Drives + OneDrive) where everything is
 otherwise loose CLI invocations plus launchd files scattered around.
 
+## All your clouds in one place, and a Mac that stays lean
+
+Two Google Drives and a OneDrive — mounted, synced and scheduled from a single
+terminal screen. No Google Drive for Desktop, no OneDrive app, no pair of
+background daemons fighting for your menu bar, no auto-updaters, no telemetry.
+
+**Lean is the point.** Mounted remotes behave like local folders while your SSD
+only ever holds a bounded cache — browse terabytes, spend gigabytes. When you do
+want files on disk, a bisync pair gives you a real local copy that works offline,
+and you choose exactly which folders deserve it. Nothing is downloaded because
+some vendor decided it should be.
+
+**Nothing exotic underneath.** Scheduling is launchd, mounting is macOS's own NFS
+client via rclone's built-in server. No macFUSE, no kernel extensions, no daemon
+of its own — and the whole thing is one readable shell script. The state lives in
+`rclone.conf` and in plain launchd plists, so you can inspect, edit or undo any
+of it by hand, with or without this tool.
+
 - **v0** — `cockpit.sh`, a bash + [gum](https://github.com/charmbracelet/gum) script. Working.
 - **v1** (planned) — Go + [Bubble Tea](https://github.com/charmbracelet/bubbletea) + Lip Gloss + Bubbles.
 
@@ -228,8 +246,44 @@ rclone delete --include ".DS_Store" gdrive-personal:                       # del
 - **launchd's PATH differs from the shell's** — hence the binary is hardcoded to
   `/opt/homebrew/bin/rclone` in the plists.
 - **Unloading a plist while its process runs**: unmount first.
+- **`This remote uses rclone's shared Google Drive client_id`** — rclone ships a
+  generic OAuth client_id so you can use it without registering your own. Google
+  enforces API quota *per client_id*, so every rclone user who never configured
+  one shares a single quota; that shared client is being retired and **stops
+  working during 2026**. Until then it also costs throttling (403/429 + retries),
+  which shows up as slow Drive scans and, indirectly, as the NFS server being
+  busy enough to trigger the popup above. The fix is a personal client_id — see
+  the roadmap entry below.
 
 ---
+
+## Planned: personal OAuth client_id
+
+**Why it is not optional:** rclone's shared Google Drive client_id is being
+retired and stops working during 2026 — after that, Drive remotes fail to
+authenticate. A personal client_id is free, takes ~10 minutes, and one is enough
+for every Drive remote.
+
+Getting the credentials (Google Cloud Console): create a project → enable the
+**Google Drive API** → configure the OAuth consent screen → create an OAuth
+client of type **Desktop app** → copy the client id and secret.
+
+> **The trap:** on the consent screen, if the app is left in **Testing** status,
+> refresh tokens expire after **7 days** and you must reauthorize weekly. It has
+> to be **published** (*In production*). No Google review is needed, since the
+> data belongs to the same account.
+
+Applying them: `rclone config update <remote> client_id <id> client_secret
+<secret>`, then reauthorize (`rclone config reconnect <remote>:`).
+
+**To implement in the TUI** — *Config → Set custom client_id*:
+- pick a remote, read the current value to show whether it is already set
+- prompt with `gum input` for the id and `gum input --password` for the secret,
+  so the secret never lands on screen or in a log
+- call `rclone config update`, then offer to reauthorize
+- offer to apply the same credentials to the other remotes of the same type
+- never accept these values as CLI arguments (they would leak into shell
+  history and the process list)
 
 ## Roadmap (v1, Go + Bubble Tea)
 
