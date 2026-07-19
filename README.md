@@ -27,15 +27,16 @@ of its own — and the whole thing is one readable shell script. The state lives
 of it by hand, with or without this tool.
 
 - **v0** — `cockpit.sh`, a bash + [gum](https://github.com/charmbracelet/gum) script. Working.
-- **v1** (planned) — Go + [Bubble Tea](https://github.com/charmbracelet/bubbletea) + Lip Gloss + Bubbles.
+- **v1** (planned) — a Go **menu-bar app** plus a Go **TUI**, both thin front-ends
+  over one shared, UI-agnostic `core` package.
 
-**The two live side by side.** v1 is not a replacement: it is a nicer UX layer
-over the same model (same paths, same plists, same launchd services, same
-derived state). The shell version stays a first-class, supported entry point —
-it is the dependency-light one that works over SSH, in a recovery shell, or when
-you just want to read what it is about to do before it does it. Any behaviour
-change should land in both, and neither should invent state the other cannot
-see.
+**Everything lives side by side over one model.** No front-end is a replacement.
+They all read the same source of truth (`rclone listremotes` + the launchd
+plists + `mount`), so the shell version stays a first-class, supported entry
+point — the dependency-light one that works over SSH, in a recovery shell, or
+when you just want to read what it is about to do before it does it. Any
+behaviour change lands in the shared core; no front-end invents state the others
+cannot see.
 
 ---
 
@@ -43,7 +44,7 @@ see.
 
 - macOS 14+ (Apple Silicon) — mounts use the **native NFS server, no macFUSE**
 - [Homebrew](https://brew.sh)
-- rclone 1.68+ · gum (v0) · Go 1.22+ (v1)
+- rclone 1.68+ · gum (v0) · Go 1.22+ and Xcode Command Line Tools (v1, cgo)
 
 ```bash
 brew install rclone gum
@@ -285,18 +286,46 @@ Applying them: `rclone config update <remote> client_id <id> client_secret
 - never accept these values as CLI arguments (they would leak into shell
   history and the process list)
 
-## Roadmap (v1, Go + Bubble Tea)
+## Roadmap (v1, Go)
 
-- Rewrite in Go using `list` / `checkbox` / `spinner` (Bubbles).
+### Shape: one core, two front-ends
+
+A single UI-agnostic **`core`** Go package holds all the logic — the same derived
+state `cockpit.sh` computes today (`listremotes` + plists + `mount`), plus
+mount/unmount, bisync runs, and the zombie detection. It exposes plain Go types
+and knows nothing about any UI. `cockpit.sh` is effectively the executable spec
+for what `core` must reproduce. Two thin front-ends sit on top:
+
+- **`cmd/menubar`** — the primary v1 surface: a macOS status-bar app showing live
+  state (reactive icon + text: mounted / unmounted / syncing / zombie), a
+  dropdown of toggles, and native notifications for conflicts and zombie repair.
+- **`cmd/tui`** — a terminal UI with [Bubble Tea](https://github.com/charmbracelet/bubbletea)
+  (`list` / `checkbox` / `spinner`), for the SSH / no-GUI case.
+
+### Menu-bar library decision
+
+Chosen: **[caseymrm/menuet](https://github.com/caseymrm/menuet)** — verified active
+in 2026 (v2.9.0). It is the only option that natively covers all three hard
+requirements at once: **styled dynamic menu-bar text** (not just an icon),
+submenus with checkmarks, and built-in native notifications. Runner-up if
+cross-platform ever matters: `energye/systray` + `gen2brew/beeep`. Rejected:
+**Fyne** (its tray shows an icon only, no menu-bar text) and **gogpu/systray**
+(no-cgo and appealing, but v0.1.x and too green). Costs to accept: macOS-only,
+cgo required, and notifications need a signed `.app` bundle with `LSUIElement`
+(wanted anyway for a menu-bar utility).
+
+### Features on top of that
+
 - **Live IN⇄OUT sync monitor** (like the native Google Drive apps), reading
   rclone's remote-control API: start mounts/bisyncs with `--rc --rc-addr` and
   poll `core/stats` / `core/transferred` to render active transfers with speed
-  and progress.
+  and progress — surfaced as menu-bar text and a detail view.
 - A sleep/wake hook to remount automatically after the Mac wakes up.
 - A watchdog for the `zombie` state (poll mount + daemon, auto-repair) so it
   never needs a manual **repair**.
+- A personal OAuth client_id flow (see above).
 - Support for other backends (S3 / Hetzner).
-- Bisync conflict notifications via `osascript`.
+- Bisync conflict notifications (native, via the menu-bar app).
 
 ## Definition of done (v0)
 
