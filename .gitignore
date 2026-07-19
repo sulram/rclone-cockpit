@@ -1,0 +1,8 @@
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+
+# built binary (v1)
+cockpit

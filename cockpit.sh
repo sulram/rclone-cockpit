@@ -1,0 +1,702 @@
+#!/usr/bin/env bash
+# rclone cockpit v0 — a bash + gum TUI to manage remotes, mounts and bisyncs.
+# Real state = rclone listremotes + plists in ~/Library/LaunchAgents + live mounts.
+set -uo pipefail
+shopt -s nullglob   # unmatched globs expand to nothing, not to the literal
+
+RCLONE=/opt/homebrew/bin/rclone          # launchd's PATH != the shell's PATH
+MOUNT_ROOT="$HOME/Drives"
+SYNC_ROOT="$HOME/sync"
+AGENTS="$HOME/Library/LaunchAgents"
+VFS_CACHE="$HOME/Library/Caches/rclone/vfs"
+LOGS="$HOME/Library/Logs/rclone-cockpit"
+CONFIG_DIR="$HOME/.config/rclone-cockpit"
+CONFIG="$CONFIG_DIR/config.env"
+
+PREFIX_MOUNT="com.marlus.rclone-mount"
+PREFIX_BISYNC="com.marlus.rclone-bisync"
+
+# defaults, overridable via config.env
+VFS_CACHE_MAX_SIZE="20G"
+VFS_CACHE_MAX_AGE="72h"
+# NFS tuning on macOS: long dir/attr caching cuts down the "Server connections
+# interrupted" popups (the NFS client complains when the rclone server is busy
+# re-scanning). poll-interval keeps remote change detection working.
+DIR_CACHE_TIME="1000h"
+ATTR_TIMEOUT="5s"
+POLL_INTERVAL="15s"
+
+# macOS junk that must not be pushed to the Drive by bisyncs (the local folder
+# is a local disk, so DSDontWriteNetworkStores doesn't cover it — filter it here)
+MAC_JUNK=(--exclude ".DS_Store" --exclude "._*" --exclude ".Spotlight-V100/**"
+          --exclude ".Trashes/**" --exclude ".fseventsd/**" --exclude ".TemporaryItems/**")
+
+mkdir -p "$CONFIG_DIR" "$LOGS"
+[[ -f "$CONFIG" ]] && . "$CONFIG"
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+die()  { gum style --foreground 1 "✗ $*"; }
+ok()   { gum style --foreground 2 "✓ $*"; }
+info() { gum style --foreground 4 "› $*"; }
+
+header() {
+  gum style --border rounded --padding "0 2" --border-foreground 4 "$*"
+}
+
+pause() { echo; gum style --faint "  ↵ press enter to go back"; read -r _; }
+
+confirm() { gum confirm "$1"; }
+
+remotes() { "$RCLONE" listremotes 2>/dev/null | sed 's/:$//'; }
+
+is_mounted() {
+  mount | grep -q " on ${MOUNT_ROOT}/$1 "
+}
+
+# a live nfsmount daemon for this remote (may exist even with no mount)
+has_daemon() {
+  pgrep -f "nfsmount $1:" >/dev/null 2>&1
+}
+
+# "zombie": the daemon is still serving NFS but the mount is gone from the
+# mount table — this is the state macOS's "Server connections interrupted"
+# leaves behind. Reading the mountpoint gives an empty folder, not an error.
+is_zombie() {
+  ! is_mounted "$1" && has_daemon "$1"
+}
+
+mount_state() {
+  if is_mounted "$1";   then echo "mounted"
+  elif has_daemon "$1"; then echo "zombie"
+  else                       echo "—"
+  fi
+}
+
+# kill the orphan daemon and mount again from scratch
+repair_mount() {
+  local r=$1
+  info "killing the orphan daemon for $r ..."
+  pkill -f "nfsmount $r:" 2>/dev/null
+  sleep 2
+  umount "$MOUNT_ROOT/$r" 2>/dev/null   # in case a stale mountpoint lingers
+  has_daemon "$r" && { die "daemon did not die — try again"; return 1; }
+  ok "daemon stopped"
+  do_mount "$r"
+}
+
+plist_mount()  { echo "$AGENTS/${PREFIX_MOUNT}-$1.plist"; }
+plist_bisync() { echo "$AGENTS/${PREFIX_BISYNC}-$1.plist"; }
+
+has_autostart_mount()  { [[ -f "$(plist_mount "$1")" ]]; }
+has_autostart_bisync() { [[ -f "$(plist_bisync "$1")" ]]; }
+
+# list the configured bisync pairs (derived from the plists)
+bisync_pairs() {
+  local f base
+  for f in "$AGENTS/${PREFIX_BISYNC}-"*.plist; do
+    [[ -e "$f" ]] || continue
+    base=$(basename "$f" .plist)
+    echo "${base#${PREFIX_BISYNC}-}"
+  done
+}
+
+# read a value stored in the plist (we use EnvironmentVariables as metadata)
+plist_env() {
+  /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$2" "$1" 2>/dev/null
+}
+
+launchctl_load() {
+  launchctl bootstrap "gui/$(id -u)" "$1" 2>/dev/null \
+    || launchctl load "$1" 2>/dev/null
+}
+
+launchctl_unload() {
+  local label; label=$(basename "$1" .plist)
+  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null \
+    || launchctl unload "$1" 2>/dev/null
+  return 0
+}
+
+# ── remotes ───────────────────────────────────────────────────────────────────
+
+menu_remotes() {
+  while true; do
+    clear; header "Accounts / remotes"
+    local list; list=$(remotes)
+    if [[ -z "$list" ]]; then
+      info "no remotes configured yet"
+    else
+      while read -r r; do
+        [[ -z "$r" ]] && continue
+        local type; type=$("$RCLONE" config show "$r" 2>/dev/null | awk -F' = ' '/^type/{print $2}')
+        printf "  %-20s %s\n" "$r" "${type:-?}"
+      done <<< "$list"
+    fi
+    echo
+
+    local action
+    action=$(gum choose "Connect Google Drive" "Connect OneDrive" "Show usage (about)" "Remove remote" "← back") || return
+    case "$action" in
+      "Connect Google Drive") new_remote drive ;;
+      "Connect OneDrive")     new_remote onedrive ;;
+      "Show usage (about)")   remote_about ;;
+      "Remove remote")        remove_remote ;;
+      *) return ;;
+    esac
+  done
+}
+
+new_remote() {
+  local type=$1 name
+  name=$(gum input --placeholder "remote name (e.g. gdrive-personal)") || return
+  [[ -z "$name" ]] && return
+  if remotes | grep -qx "$name"; then die "remote '$name' already exists"; pause; return; fi
+
+  info "opening OAuth in the browser — authorize and come back here"
+  "$RCLONE" config create "$name" "$type" && ok "remote '$name' created" || die "failed"
+  pause
+}
+
+remote_about() {
+  local r; r=$(remotes | gum choose --header "which remote?") || return
+  [[ -z "$r" ]] && return
+  clear; header "$r"
+  "$RCLONE" about "$r:" 2>&1
+  echo; pause
+}
+
+remove_remote() {
+  local r; r=$(remotes | gum choose --header "remove which?") || return
+  [[ -z "$r" ]] && return
+  confirm "remove '$r'? (its mounts/autostart will be turned off)" || return
+  is_mounted "$r" && do_umount "$r"
+  has_autostart_mount "$r" && autostart_mount_off "$r"
+  "$RCLONE" config delete "$r" && ok "removed" || die "failed"
+  pause
+}
+
+# ── mounts ────────────────────────────────────────────────────────────────────
+
+# nfsmount (not 'mount'): on macOS it uses the native NFS server, no macFUSE.
+# The Homebrew rclone build blocks 'mount' but allows 'nfsmount'.
+mount_args() {
+  local r=$1
+  echo "nfsmount $r: $MOUNT_ROOT/$r \
+--vfs-cache-mode full \
+--vfs-cache-max-size $VFS_CACHE_MAX_SIZE \
+--vfs-cache-max-age $VFS_CACHE_MAX_AGE \
+--dir-cache-time $DIR_CACHE_TIME \
+--attr-timeout $ATTR_TIMEOUT \
+--poll-interval $POLL_INTERVAL"
+}
+
+do_mount() {
+  local r=$1
+  mkdir -p "$MOUNT_ROOT/$r"
+  # shellcheck disable=SC2046
+  if ! "$RCLONE" $(mount_args "$r") --daemon --log-file "$LOGS/mount-$r.log"; then
+    die "failed to start the daemon (log: $LOGS/mount-$r.log)"; return 1
+  fi
+  # NFS server + OAuth can take a few seconds to show up in the mount table
+  local i
+  for i in $(seq 1 10); do
+    is_mounted "$r" && { ok "mounted at ~/Drives/$r"; return 0; }
+    sleep 1
+  done
+  die "started but did not appear in mount within 10s — see $LOGS/mount-$r.log"
+}
+
+do_umount() {
+  local r=$1
+  umount "$MOUNT_ROOT/$r" 2>/dev/null || diskutil unmount force "$MOUNT_ROOT/$r" >/dev/null 2>&1
+  is_mounted "$r" && die "still mounted" || ok "unmounted"
+}
+
+autostart_mount_on() {
+  local r=$1 p; p=$(plist_mount "$r")
+  mkdir -p "$MOUNT_ROOT/$r"
+  cat > "$p" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${PREFIX_MOUNT}-${r}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${RCLONE}</string>
+    <string>nfsmount</string>
+    <string>${r}:</string>
+    <string>${MOUNT_ROOT}/${r}</string>
+    <string>--vfs-cache-mode</string><string>full</string>
+    <string>--vfs-cache-max-size</string><string>${VFS_CACHE_MAX_SIZE}</string>
+    <string>--vfs-cache-max-age</string><string>${VFS_CACHE_MAX_AGE}</string>
+    <string>--dir-cache-time</string><string>${DIR_CACHE_TIME}</string>
+    <string>--attr-timeout</string><string>${ATTR_TIMEOUT}</string>
+    <string>--poll-interval</string><string>${POLL_INTERVAL}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${LOGS}/mount-${r}.log</string>
+  <key>StandardErrorPath</key><string>${LOGS}/mount-${r}.log</string>
+</dict>
+</plist>
+EOF
+  # if a manual mount is already running, launchd can't mount on top of it
+  is_mounted "$r" && do_umount "$r" >/dev/null
+  launchctl_load "$p" && ok "autostart enabled" || die "launchctl complained"
+}
+
+autostart_mount_off() {
+  local r=$1 p; p=$(plist_mount "$r")
+  launchctl_unload "$p"
+  is_mounted "$r" && do_umount "$r" >/dev/null   # unmount before removing the plist
+  rm -f "$p"
+  ok "autostart disabled"
+}
+
+menu_mounts() {
+  while true; do
+    clear; header "Mounts  (~/Drives)"
+    local list; list=$(remotes)
+    if [[ -z "$list" ]]; then
+      info "connect a remote first"; echo; pause; return
+    fi
+    local any_zombie=0
+    while read -r r; do
+      [[ -z "$r" ]] && continue
+      local st auto
+      st=$(mount_state "$r")
+      [[ "$st" == "zombie" ]] && any_zombie=1
+      has_autostart_mount "$r" && auto="[x] auto" || auto="[ ] auto"
+      printf "  %-20s %-10s %s\n" "$r" "$st" "$auto"
+    done <<< "$list"
+    [[ "$any_zombie" == "1" ]] && { echo; die "zombie = daemon alive but mount gone (use 'repair')"; }
+    echo
+
+    local r; r=$(printf "%s\n← back\n" "$list" | gum choose --header "which remote?") || return
+    [[ -z "$r" || "$r" == "← back" ]] && return
+
+    local acts=()
+    if is_zombie "$r"; then
+      acts+=("repair (kill orphan daemon + remount)")
+    elif is_mounted "$r"; then
+      acts+=("unmount")
+    else
+      acts+=("mount")
+    fi
+    has_autostart_mount "$r" && acts+=("autostart: disable") || acts+=("autostart: enable")
+    acts+=("← back")
+
+    local a; a=$(printf '%s\n' "${acts[@]}" | gum choose --header "$r") || continue
+    case "$a" in
+      mount)                 do_mount "$r"; pause ;;
+      unmount)               do_umount "$r"; pause ;;
+      repair*)               repair_mount "$r"; pause ;;
+      "autostart: enable")   autostart_mount_on "$r"; pause ;;
+      "autostart: disable")  autostart_mount_off "$r"; pause ;;
+    esac
+  done
+}
+
+# ── bisync ────────────────────────────────────────────────────────────────────
+
+bisync_run() {
+  local pair=$1 extra=${2:-}
+  local p; p=$(plist_bisync "$pair")
+  local remote local_dir
+  remote=$(plist_env "$p" COCKPIT_REMOTE)
+  local_dir=$(plist_env "$p" COCKPIT_LOCAL)
+  [[ -z "$remote" ]] && { die "could not find metadata for pair '$pair'"; return 1; }
+
+  # interactive run: output to screen and log (launchd uses --log-file in the plist)
+  # shellcheck disable=SC2086
+  "$RCLONE" bisync "$remote" "$local_dir" $extra "${MAC_JUNK[@]}" \
+    --create-empty-src-dirs --conflict-resolve newer --conflict-loser pathname \
+    -v --stats-one-line 2>&1 | tee -a "$LOGS/bisync-$pair.log"
+  return "${PIPESTATUS[0]}"
+}
+
+bisync_new() {
+  local r; r=$(remotes | gum choose --header "source remote") || return
+  [[ -z "$r" ]] && return
+
+  info "listing folders in $r: ..."
+  local dirs; dirs=$("$RCLONE" lsd "$r:" 2>/dev/null | awk '{ $1=$2=$3=$4=""; sub(/^ +/,""); print }')
+  [[ -z "$dirs" ]] && { die "no folders in $r:"; pause; return; }
+
+  local folder; folder=$(printf '%s\n' "$dirs" | gum choose --header "which folder?") || return
+  [[ -z "$folder" ]] && return
+
+  local pair; pair=$(echo "$folder" | tr ' /' '--' | tr '[:upper:]' '[:lower:]')
+  pair=$(gum input --value "$pair" --placeholder "pair name (becomes ~/sync/<name>)") || return
+  [[ -z "$pair" ]] && return
+  has_autostart_bisync "$pair" && { die "pair '$pair' already exists"; pause; return; }
+
+  local interval; interval=$(gum choose --header "interval" "1h" "30min") || return
+  local secs=3600; [[ "$interval" == "30min" ]] && secs=1800
+
+  local remote_path="$r:$folder" local_dir="$SYNC_ROOT/$pair"
+  mkdir -p "$local_dir"
+
+  # <string> tags for the Mac junk excludes, so launchd runs the same as the TUI
+  local junk_xml="" j
+  for j in "${MAC_JUNK[@]}"; do junk_xml+="    <string>${j}</string>"$'\n'; done
+
+  local p; p=$(plist_bisync "$pair")
+  cat > "$p" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${PREFIX_BISYNC}-${pair}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>COCKPIT_REMOTE</key><string>${remote_path}</string>
+    <key>COCKPIT_LOCAL</key><string>${local_dir}</string>
+  </dict>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${RCLONE}</string>
+    <string>bisync</string>
+    <string>${remote_path}</string>
+    <string>${local_dir}</string>
+    <string>--create-empty-src-dirs</string>
+    <string>--conflict-resolve</string><string>newer</string>
+    <string>--conflict-loser</string><string>pathname</string>
+${junk_xml}    <string>--log-file</string><string>${LOGS}/bisync-${pair}.log</string>
+    <string>--log-level</string><string>INFO</string>
+  </array>
+  <key>StartInterval</key><integer>${secs}</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>${LOGS}/bisync-${pair}.out</string>
+  <key>StandardErrorPath</key><string>${LOGS}/bisync-${pair}.out</string>
+</dict>
+</plist>
+EOF
+
+  info "baseline: the first run needs --resync (may take a while)"
+  if confirm "run --resync now?"; then
+    clear; header "resync $pair"
+    bisync_run "$pair" "--resync" && ok "baseline created" || die "resync failed — see $LOGS/bisync-$pair.log"
+  fi
+
+  if confirm "enable autostart ($interval)?"; then
+    launchctl_load "$p" && ok "scheduled every $interval" || die "launchctl complained"
+  fi
+  pause
+}
+
+bisync_status() {
+  local pair=$1 p; p=$(plist_bisync "$pair")
+  clear; header "bisync: $pair"
+  echo "  remote:   $(plist_env "$p" COCKPIT_REMOTE)"
+  echo "  local:    $(plist_env "$p" COCKPIT_LOCAL)"
+  echo "  interval: $(/usr/libexec/PlistBuddy -c 'Print :StartInterval' "$p" 2>/dev/null)s"
+  local log="$LOGS/bisync-$pair.log"
+  if [[ -f "$log" ]]; then
+    echo "  last run: $(stat -f '%Sm' "$log")"
+    echo; info "last lines:"; tail -8 "$log"
+  else
+    echo "  last run: never"
+  fi
+  local conflicts; conflicts=$(find "$(plist_env "$p" COCKPIT_LOCAL)" -name '*..conflict*' 2>/dev/null | wc -l | tr -d ' ')
+  [[ "$conflicts" != "0" ]] && die "$conflicts file(s) in conflict"
+  echo; pause
+}
+
+bisync_remove() {
+  local pair=$1 p; p=$(plist_bisync "$pair")
+  local local_dir; local_dir=$(plist_env "$p" COCKPIT_LOCAL)
+  confirm "disable pair '$pair'?" || return
+  launchctl_unload "$p"
+  rm -f "$p"
+  ok "pair disabled"
+  if [[ -d "$local_dir" ]] && confirm "delete the local folder $local_dir too?"; then
+    rm -rf "$local_dir" && ok "folder deleted"
+  fi
+  pause
+}
+
+menu_bisync() {
+  while true; do
+    clear; header "Bidirectional  (~/sync)"
+    local pairs; pairs=$(bisync_pairs)
+    if [[ -z "$pairs" ]]; then
+      info "no pairs configured"
+    else
+      while read -r pair; do
+        [[ -z "$pair" ]] && continue
+        local p; p=$(plist_bisync "$pair")
+        local secs; secs=$(/usr/libexec/PlistBuddy -c 'Print :StartInterval' "$p" 2>/dev/null)
+        local every="?"; [[ "$secs" == "3600" ]] && every="1h"; [[ "$secs" == "1800" ]] && every="30min"
+        printf "  %-20s %-30s every %s\n" "$pair" "$(plist_env "$p" COCKPIT_REMOTE)" "$every"
+      done <<< "$pairs"
+    fi
+    echo
+
+    local opts=("+ new pair")
+    [[ -n "$pairs" ]] && while read -r pair; do [[ -n "$pair" ]] && opts+=("$pair"); done <<< "$pairs"
+    opts+=("← back")
+
+    local sel; sel=$(printf '%s\n' "${opts[@]}" | gum choose) || return
+    case "$sel" in
+      "+ new pair") bisync_new ;;
+      "← back"|"") return ;;
+      *)
+        local a; a=$(gum choose --header "$sel" "status" "sync now" "dry-run" "resync (rebaseline)" "disable" "← back") || continue
+        case "$a" in
+          status)                clear; bisync_status "$sel" ;;
+          "sync now")            clear; header "sync $sel"; bisync_run "$sel" && ok "sync ok" || die "failed — see $LOGS/bisync-$sel.log"; pause ;;
+          dry-run)               clear; header "dry-run $sel"; bisync_run "$sel" "--dry-run"; pause ;;
+          "resync (rebaseline)") confirm "rebuild baseline for '$sel'?" && { clear; bisync_run "$sel" "--resync" && ok "ok" || die "failed"; pause; } ;;
+          disable)               bisync_remove "$sel" ;;
+        esac
+        ;;
+    esac
+  done
+}
+
+# ── logs & on-disk files ──────────────────────────────────────────────────────
+
+# list the available logs as "mount:<remote>" / "bisync:<pair>"
+log_sources() {
+  local f base
+  for f in "$LOGS"/mount-*.log; do
+    base=$(basename "$f" .log); echo "mount:${base#mount-}"
+  done
+  for f in "$LOGS"/bisync-*.log; do
+    base=$(basename "$f" .log); echo "bisync:${base#bisync-}"
+  done
+}
+
+log_path_for() {  # "mount:gdrive" -> path to the .log
+  local kind=${1%%:*} name=${1#*:}
+  echo "$LOGS/$kind-$name.log"
+}
+
+# where files are materialized on disk for each source
+disk_path_for() {
+  local kind=${1%%:*} name=${1#*:}
+  if [[ "$kind" == "bisync" ]]; then
+    plist_env "$(plist_bisync "$name")" COCKPIT_LOCAL
+  else
+    echo "$VFS_CACHE/$name"       # VFS cache = what the mount downloaded to disk
+  fi
+}
+
+view_disk_files() {
+  local src=$1 dir; dir=$(disk_path_for "$src")
+  clear; header "on-disk files — $src"
+  if [[ -z "$dir" || ! -d "$dir" ]]; then
+    info "nothing materialized on disk yet"
+    [[ "${src%%:*}" == "mount" ]] && info "(a mount only downloads files when they are opened/read)"
+    echo; pause; return
+  fi
+  echo "  local: $dir"
+  echo "  total: $(du -sh "$dir" 2>/dev/null | cut -f1)"
+  echo; info "files (by date, most recent first):"
+  # list real files with size, sorted by mtime
+  find "$dir" -type f ! -name '.*' -exec stat -f '%m %z %N' {} + 2>/dev/null \
+    | sort -rn | head -40 \
+    | while read -r mt sz path; do
+        printf "  %6s  %s\n" "$(numfmt --to=iec "$sz" 2>/dev/null || echo "${sz}B")" "${path#$dir/}"
+      done
+  echo; pause
+}
+
+menu_logs() {
+  while true; do
+    clear; header "Logs & files"
+    local srcs; srcs=$(log_sources)
+    if [[ -z "$srcs" ]]; then
+      info "no logs yet — mount a drive or run a bisync"; echo; pause; return
+    fi
+    while read -r s; do
+      [[ -z "$s" ]] && continue
+      local lp; lp=$(log_path_for "$s")
+      printf "  %-28s %s\n" "$s" "$(stat -f '%Sm' "$lp" 2>/dev/null)"
+    done <<< "$srcs"
+    echo
+
+    local sel; sel=$(printf "%s\n← back" "$srcs" | gum choose --header "which source?") || return
+    [[ -z "$sel" || "$sel" == "← back" ]] && return
+
+    local a; a=$(gum choose --header "$sel" \
+      "view log (paged)" "follow live (Ctrl-C to exit)" "on-disk files" "← back") || continue
+    local lp; lp=$(log_path_for "$sel")
+    case "$a" in
+      "view log (paged)")
+        if [[ -s "$lp" ]]; then gum pager < "$lp"; else clear; info "empty log"; pause; fi ;;
+      "follow live (Ctrl-C to exit)")
+        clear; header "$sel — live (Ctrl-C goes back)"
+        ( trap 'exit 0' INT; tail -n 30 -f "$lp" ) ;;
+      "on-disk files")
+        view_disk_files "$sel" ;;
+    esac
+  done
+}
+
+# ── config / maintenance ──────────────────────────────────────────────────────
+
+DS_KEY="DSDontWriteNetworkStores"
+
+dsstore_hardened() {  # true if already =1
+  [[ "$(defaults read com.apple.desktopservices "$DS_KEY" 2>/dev/null)" == "1" ]]
+}
+
+harden_dsstore() {
+  clear; header "Block .DS_Store on network volumes"
+  echo "  key: com.apple.desktopservices $DS_KEY"
+  if dsstore_hardened; then
+    ok "already hardened (=1)"
+    echo; info "stops Finder from creating .DS_Store on NFS mounts (~/Drives)"
+    echo; pause; return
+  fi
+  info "currently off — Finder creates .DS_Store on the mounts"
+  echo
+  confirm "apply (defaults write ... $DS_KEY -bool true)?" || return
+  defaults write com.apple.desktopservices "$DS_KEY" -bool true
+  if dsstore_hardened; then
+    ok "hardened (=1)"
+    info "takes effect after re-login. restarting Finder now helps:"
+    if confirm "restart Finder now (killall Finder)?"; then
+      killall Finder 2>/dev/null && ok "Finder restarted" || info "Finder was already restarting"
+    fi
+  else
+    die "could not write the preference"
+  fi
+  pause
+}
+
+# list a remote's .DS_Store (recursive) into a file; echo the count
+dsstore_scan() {
+  local r=$1 out=$2
+  gum spin --title "searching for .DS_Store in $r: ..." -- \
+    bash -c "'$RCLONE' lsf -R --files-only --include '.DS_Store' '$r:' > '$out' 2>/dev/null"
+  grep -c . "$out" 2>/dev/null || echo 0
+}
+
+clean_dsstore() {
+  local r; r=$(remotes | gum choose --header "check/clean .DS_Store on which remote?") || return
+  [[ -z "$r" ]] && return
+  local tmp; tmp=$(mktemp)
+  local n; n=$(dsstore_scan "$r" "$tmp")
+  clear; header ".DS_Store in $r:"
+  if [[ "$n" -eq 0 ]]; then
+    ok "no .DS_Store found 🎉"; rm -f "$tmp"; echo; pause; return
+  fi
+  die "$n .DS_Store file(s) on the Drive"
+  echo; info "examples:"; head -10 "$tmp" | sed 's/^/  /'
+  [[ "$n" -gt 10 ]] && echo "  ... (+$((n-10)))"
+  echo
+  if confirm "DELETE the $n .DS_Store in $r: from the cloud? (irreversible)"; then
+    gum spin --title "deleting in $r: ..." -- \
+      "$RCLONE" delete --include ".DS_Store" "$r:"
+    # verify
+    local left; left=$(dsstore_scan "$r" "$tmp")
+    [[ "$left" -eq 0 ]] && ok "deleted — $r: is clean" || die "$left still remain (check the rclone log)"
+  else
+    info "nothing deleted"
+  fi
+  rm -f "$tmp"
+  pause
+}
+
+menu_config() {
+  while true; do
+    clear; header "Config / maintenance"
+    local st; dsstore_hardened && st="on ✓" || st="off ✗"
+    printf "  .DS_Store network block: %s\n" "$st"
+    echo
+    local a; a=$(gum choose \
+      "Block .DS_Store on network (DSDontWriteNetworkStores)" \
+      "Check/clean .DS_Store on a remote" \
+      "← back") || return
+    case "$a" in
+      "Block"*)       harden_dsstore ;;
+      "Check/clean"*) clean_dsstore ;;
+      *) return ;;
+    esac
+  done
+}
+
+# ── open in Finder ────────────────────────────────────────────────────────────
+
+menu_finder() {
+  local sel
+  sel=$(gum choose --header "open in Finder" \
+    "app config     ($CONFIG_DIR)" \
+    "launchd plists ($AGENTS)" \
+    "logs           ($LOGS)" \
+    "rclone.conf    (~/.config/rclone)" \
+    "mounts         ($MOUNT_ROOT)" \
+    "sync           ($SYNC_ROOT)" \
+    "← back") || return
+  local dir
+  case "$sel" in
+    "app config"*)  dir="$CONFIG_DIR" ;;
+    "launchd"*)     dir="$AGENTS" ;;
+    "logs"*)        dir="$LOGS" ;;
+    "rclone.conf"*) dir="$HOME/.config/rclone" ;;
+    "mounts"*)      dir="$MOUNT_ROOT" ;;
+    "sync"*)        dir="$SYNC_ROOT" ;;
+    *) return ;;
+  esac
+  mkdir -p "$dir"
+  open "$dir" && ok "opened $dir in Finder" || die "could not open $dir"
+  sleep 1
+}
+
+# ── cache ─────────────────────────────────────────────────────────────────────
+
+menu_cache() {
+  clear; header "VFS cache"
+  if [[ -d "$VFS_CACHE" ]]; then
+    du -sh "$VFS_CACHE"/* 2>/dev/null | sed 's|'"$VFS_CACHE"'/|  |' || info "empty"
+    echo
+    echo "  total: $(du -sh "$VFS_CACHE" 2>/dev/null | cut -f1)"
+  else
+    info "no cache yet"
+  fi
+  echo
+  if confirm "clear the cache? (only what is not in use)"; then
+    rm -rf "${VFS_CACHE:?}"/* 2>/dev/null
+    ok "cleared"
+  fi
+  pause
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+main() {
+  command -v gum >/dev/null || { echo "gum not installed: brew install gum"; exit 1; }
+  [[ -x "$RCLONE" ]] || { echo "rclone not found at $RCLONE"; exit 1; }
+
+  while true; do
+    clear
+    gum style --border double --padding "1 4" --border-foreground 5 --align center \
+      "rclone cockpit" "v0"
+    echo
+    local n_rem n_mnt n_bi
+    n_rem=$(remotes | grep -c . || true)
+    n_mnt=$(mount | grep -c " on ${MOUNT_ROOT}/" || true)
+    n_bi=$(bisync_pairs | grep -c . || true)
+    gum style --faint "  $n_rem remotes · $n_mnt mounted · $n_bi bisyncs"
+    echo
+
+    local c; c=$(gum choose "Accounts" "Mounts" "Bidirectional" "Logs" "Cache" "Config" "Open in Finder" "Quit") || exit 0
+    case "$c" in
+      Accounts)          menu_remotes ;;
+      Mounts)            menu_mounts ;;
+      Bidirectional)     menu_bisync ;;
+      Logs)              menu_logs ;;
+      Cache)             menu_cache ;;
+      Config)            menu_config ;;
+      "Open in Finder")  menu_finder ;;
+      Quit|"")           clear; exit 0 ;;
+    esac
+  done
+}
+
+main "$@"
