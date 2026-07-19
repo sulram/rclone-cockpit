@@ -31,6 +31,18 @@ POLL_INTERVAL="15s"
 MAC_JUNK=(--exclude ".DS_Store" --exclude "._*" --exclude ".Spotlight-V100/**"
           --exclude ".Trashes/**" --exclude ".fseventsd/**" --exclude ".TemporaryItems/**")
 
+# Skip files touched in the last minute. A big file still being copied into the
+# folder would otherwise be uploaded half-written, then re-uploaded whole on the
+# next run. Matters more with short intervals.
+BISYNC_MIN_AGE="1m"
+
+# selectable bisync intervals, as label:seconds
+BISYNC_INTERVALS=("5min:300" "10min:600" "15min:900" "30min:1800" "1h:3600")
+
+interval_labels() { local i; for i in "${BISYNC_INTERVALS[@]}"; do echo "${i%%:*}"; done; }
+interval_secs()   { local i; for i in "${BISYNC_INTERVALS[@]}"; do [[ "${i%%:*}" == "$1" ]] && { echo "${i##*:}"; return; }; done; echo 1800; }
+secs_label()      { local i; for i in "${BISYNC_INTERVALS[@]}"; do [[ "${i##*:}" == "$1" ]] && { echo "${i%%:*}"; return; }; done; echo "?"; }
+
 mkdir -p "$CONFIG_DIR" "$LOGS"
 [[ -f "$CONFIG" ]] && . "$CONFIG"
 
@@ -313,31 +325,46 @@ bisync_run() {
   # shellcheck disable=SC2086
   "$RCLONE" bisync "$remote" "$local_dir" $extra "${MAC_JUNK[@]}" \
     --create-empty-src-dirs --conflict-resolve newer --conflict-loser pathname \
+    --min-age "$BISYNC_MIN_AGE" \
     -v --stats-one-line 2>&1 | tee -a "$LOGS/bisync-$pair.log"
   return "${PIPESTATUS[0]}"
 }
 
-bisync_new() {
-  local r; r=$(remotes | gum choose --header "source remote") || return
-  [[ -z "$r" ]] && return
+# rclone refuses to sync and demands --resync in a few situations: an
+# interrupted run, or a baseline taken while a side was empty. Detect it from
+# the log so we can offer the fix instead of just reporting failure.
+bisync_needs_resync() {
+  tail -40 "$LOGS/bisync-$1.log" 2>/dev/null | grep -q "run --resync"
+}
 
-  info "listing folders in $r: ..."
-  local dirs; dirs=$("$RCLONE" lsd "$r:" 2>/dev/null | awk '{ $1=$2=$3=$4=""; sub(/^ +/,""); print }')
-  [[ -z "$dirs" ]] && { die "no folders in $r:"; pause; return; }
+# Run a pair and, if rclone bails asking for a resync, offer to do it.
+bisync_run_or_offer_resync() {
+  local pair=$1
+  clear; header "sync $pair"
+  if bisync_run "$pair"; then ok "sync ok"; pause; return 0; fi
 
-  local folder; folder=$(printf '%s\n' "$dirs" | gum choose --header "which folder?") || return
-  [[ -z "$folder" ]] && return
+  if bisync_needs_resync "$pair"; then
+    echo
+    die "rclone aborted and needs a new baseline (--resync)"
+    info "usual causes: a previous run was interrupted, or the baseline was"
+    info "taken while one of the sides was still empty"
+    echo
+    if confirm "run --resync for '$pair' now?"; then
+      clear; header "resync $pair"
+      bisync_run "$pair" "--resync" && ok "baseline rebuilt — pair is in sync" \
+        || die "resync failed — see $LOGS/bisync-$pair.log"
+    fi
+  else
+    die "failed — see $LOGS/bisync-$pair.log"
+  fi
+  pause
+}
 
-  local pair; pair=$(echo "$folder" | tr ' /' '--' | tr '[:upper:]' '[:lower:]')
-  pair=$(gum input --value "$pair" --placeholder "pair name (becomes ~/sync/<name>)") || return
-  [[ -z "$pair" ]] && return
-  has_autostart_bisync "$pair" && { die "pair '$pair' already exists"; pause; return; }
-
-  local interval; interval=$(gum choose --header "interval" "1h" "30min") || return
-  local secs=3600; [[ "$interval" == "30min" ]] && secs=1800
-
-  local remote_path="$r:$folder" local_dir="$SYNC_ROOT/$pair"
-  mkdir -p "$local_dir"
+# Write (or rewrite) a pair's plist in the current format. Used both when
+# creating a pair and when changing its interval, so an old plist is upgraded
+# in place instead of drifting from what new pairs get.
+bisync_write_plist() {
+  local pair=$1 remote_path=$2 local_dir=$3 secs=$4
 
   # <string> tags for the Mac junk excludes, so launchd runs the same as the TUI
   local junk_xml="" j
@@ -364,16 +391,42 @@ bisync_new() {
     <string>--create-empty-src-dirs</string>
     <string>--conflict-resolve</string><string>newer</string>
     <string>--conflict-loser</string><string>pathname</string>
+    <string>--min-age</string><string>${BISYNC_MIN_AGE}</string>
 ${junk_xml}    <string>--log-file</string><string>${LOGS}/bisync-${pair}.log</string>
     <string>--log-level</string><string>INFO</string>
   </array>
   <key>StartInterval</key><integer>${secs}</integer>
-  <key>RunAtLoad</key><false/>
+  <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>${LOGS}/bisync-${pair}.out</string>
   <key>StandardErrorPath</key><string>${LOGS}/bisync-${pair}.out</string>
 </dict>
 </plist>
 EOF
+}
+
+bisync_new() {
+  local r; r=$(remotes | gum choose --header "source remote") || return
+  [[ -z "$r" ]] && return
+
+  info "listing folders in $r: ..."
+  local dirs; dirs=$("$RCLONE" lsd "$r:" 2>/dev/null | awk '{ $1=$2=$3=$4=""; sub(/^ +/,""); print }')
+  [[ -z "$dirs" ]] && { die "no folders in $r:"; pause; return; }
+
+  local folder; folder=$(printf '%s\n' "$dirs" | gum choose --header "which folder?") || return
+  [[ -z "$folder" ]] && return
+
+  local pair; pair=$(echo "$folder" | tr ' /' '--' | tr '[:upper:]' '[:lower:]')
+  pair=$(gum input --value "$pair" --placeholder "pair name (becomes ~/sync/<name>)") || return
+  [[ -z "$pair" ]] && return
+  has_autostart_bisync "$pair" && { die "pair '$pair' already exists"; pause; return; }
+
+  local interval; interval=$(interval_labels | gum choose --header "interval") || return
+  [[ -z "$interval" ]] && return
+  local secs; secs=$(interval_secs "$interval")
+
+  local remote_path="$r:$folder" local_dir="$SYNC_ROOT/$pair"
+  mkdir -p "$local_dir"
+  bisync_write_plist "$pair" "$remote_path" "$local_dir" "$secs"
 
   info "baseline: the first run needs --resync (may take a while)"
   if confirm "run --resync now?"; then
@@ -382,7 +435,32 @@ EOF
   fi
 
   if confirm "enable autostart ($interval)?"; then
-    launchctl_load "$p" && ok "scheduled every $interval" || die "launchctl complained"
+    launchctl_load "$(plist_bisync "$pair")" && ok "scheduled every $interval" || die "launchctl complained"
+  fi
+  pause
+}
+
+# Change a pair's interval. Rewrites the plist in the current format (so old
+# pairs also gain RunAtLoad/--min-age) and reloads the launchd job.
+bisync_set_interval() {
+  local pair=$1 p; p=$(plist_bisync "$pair")
+  local remote_path local_dir cur
+  remote_path=$(plist_env "$p" COCKPIT_REMOTE)
+  local_dir=$(plist_env "$p" COCKPIT_LOCAL)
+  cur=$(/usr/libexec/PlistBuddy -c 'Print :StartInterval' "$p" 2>/dev/null)
+  [[ -z "$remote_path" ]] && { die "could not read metadata for '$pair'"; pause; return 1; }
+
+  local interval
+  interval=$(interval_labels | gum choose --header "interval for '$pair' (now: $(secs_label "$cur"))") || return
+  [[ -z "$interval" ]] && return
+  local secs; secs=$(interval_secs "$interval")
+
+  launchctl_unload "$p"
+  bisync_write_plist "$pair" "$remote_path" "$local_dir" "$secs"
+  if launchctl_load "$p"; then
+    ok "'$pair' now runs every $interval (plist upgraded to the current format)"
+  else
+    die "plist rewritten but launchctl complained"
   fi
   pause
 }
@@ -429,8 +507,7 @@ menu_bisync() {
         [[ -z "$pair" ]] && continue
         local p; p=$(plist_bisync "$pair")
         local secs; secs=$(/usr/libexec/PlistBuddy -c 'Print :StartInterval' "$p" 2>/dev/null)
-        local every="?"; [[ "$secs" == "3600" ]] && every="1h"; [[ "$secs" == "1800" ]] && every="30min"
-        printf "  %-20s %-30s every %s\n" "$pair" "$(plist_env "$p" COCKPIT_REMOTE)" "$every"
+        printf "  %-20s %-30s every %s\n" "$pair" "$(plist_env "$p" COCKPIT_REMOTE)" "$(secs_label "$secs")"
       done <<< "$pairs"
     fi
     echo
@@ -444,10 +521,11 @@ menu_bisync() {
       "+ new pair") bisync_new ;;
       "← back"|"") return ;;
       *)
-        local a; a=$(gum choose --header "$sel" "status" "sync now" "dry-run" "resync (rebaseline)" "disable" "← back") || continue
+        local a; a=$(gum choose --header "$sel" "status" "sync now" "dry-run" "resync (rebaseline)" "change interval" "disable" "← back") || continue
         case "$a" in
           status)                clear; bisync_status "$sel" ;;
-          "sync now")            clear; header "sync $sel"; bisync_run "$sel" && ok "sync ok" || die "failed — see $LOGS/bisync-$sel.log"; pause ;;
+          "sync now")            bisync_run_or_offer_resync "$sel" ;;
+          "change interval")     bisync_set_interval "$sel" ;;
           dry-run)               clear; header "dry-run $sel"; bisync_run "$sel" "--dry-run"; pause ;;
           "resync (rebaseline)") confirm "rebuild baseline for '$sel'?" && { clear; bisync_run "$sel" "--resync" && ok "ok" || die "failed"; pause; } ;;
           disable)               bisync_remove "$sel" ;;
@@ -569,37 +647,90 @@ harden_dsstore() {
   pause
 }
 
-# list a remote's .DS_Store (recursive) into a file; echo the count
+SPIN_FRAMES=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+
+# count non-empty lines. grep -c already prints 0 for no match, but exits 1 —
+# so never add a `|| echo 0` fallback here, it would print "0" twice.
+count_lines() { local n; n=$(grep -c . "$1" 2>/dev/null); echo "${n:-0}"; }
+
+# same, for lines matching a pattern
+count_matching() { local n; n=$(grep -c "$2" "$1" 2>/dev/null); echo "${n:-0}"; }
+
+# Scan a remote for .DS_Store into $2. Live count + elapsed, Ctrl-C cancels.
+# Returns 130 if cancelled. The caller reads the count from the file.
 dsstore_scan() {
   local r=$1 out=$2
-  gum spin --title "searching for .DS_Store in $r: ..." -- \
-    bash -c "'$RCLONE' lsf -R --files-only --include '.DS_Store' '$r:' > '$out' 2>/dev/null"
-  grep -c . "$out" 2>/dev/null || echo 0
+  : > "$out"
+  "$RCLONE" lsf -R --files-only --include ".DS_Store" "$r:" > "$out" 2>/dev/null &
+  local pid=$! cancelled=0 i=0 start=$SECONDS
+  # shellcheck disable=SC2064
+  trap "cancelled=1; kill $pid 2>/dev/null" INT
+  while kill -0 "$pid" 2>/dev/null; do
+    printf "\r  %s scanning %s:  %s found · %ss   (Ctrl-C to cancel)\033[K" \
+      "${SPIN_FRAMES[i++ % 10]}" "$r" "$(count_lines "$out")" "$((SECONDS - start))"
+    sleep 0.2
+  done
+  trap - INT
+  wait "$pid" 2>/dev/null
+  printf "\r\033[K"
+  [[ "$cancelled" == 1 ]] && return 130
+  return 0
+}
+
+# Delete the .DS_Store of a remote showing "n/total done". Ctrl-C cancels
+# (already-deleted files stay deleted — rclone has no transaction).
+dsstore_delete() {
+  local r=$1 total=$2 log=$3
+  : > "$log"
+  "$RCLONE" delete --include ".DS_Store" -v "$r:" > "$log" 2>&1 &
+  local pid=$! cancelled=0 i=0 start=$SECONDS
+  # shellcheck disable=SC2064
+  trap "cancelled=1; kill $pid 2>/dev/null" INT
+  while kill -0 "$pid" 2>/dev/null; do
+    printf "\r  %s deleting in %s:  %s/%s · %ss   (Ctrl-C to cancel)\033[K" \
+      "${SPIN_FRAMES[i++ % 10]}" "$r" "$(count_matching "$log" '\.DS_Store:')" \
+      "$total" "$((SECONDS - start))"
+    sleep 0.2
+  done
+  trap - INT
+  wait "$pid" 2>/dev/null; local rc=$?
+  printf "\r\033[K"
+  [[ "$cancelled" == 1 ]] && return 130
+  return "$rc"
 }
 
 clean_dsstore() {
   local r; r=$(remotes | gum choose --header "check/clean .DS_Store on which remote?") || return
   [[ -z "$r" ]] && return
-  local tmp; tmp=$(mktemp)
-  local n; n=$(dsstore_scan "$r" "$tmp")
+  local tmp log
+  tmp=$(mktemp); log=$(mktemp)
   clear; header ".DS_Store in $r:"
-  if [[ "$n" -eq 0 ]]; then
-    ok "no .DS_Store found 🎉"; rm -f "$tmp"; echo; pause; return
+
+  if ! dsstore_scan "$r" "$tmp"; then
+    info "scan cancelled"; rm -f "$tmp" "$log"; pause; return
   fi
+  local n; n=$(count_lines "$tmp")
+  if [[ "$n" -eq 0 ]]; then
+    ok "no .DS_Store found 🎉"; rm -f "$tmp" "$log"; echo; pause; return
+  fi
+
   die "$n .DS_Store file(s) on the Drive"
   echo; info "examples:"; head -10 "$tmp" | sed 's/^/  /'
   [[ "$n" -gt 10 ]] && echo "  ... (+$((n-10)))"
   echo
   if confirm "DELETE the $n .DS_Store in $r: from the cloud? (irreversible)"; then
-    gum spin --title "deleting in $r: ..." -- \
-      "$RCLONE" delete --include ".DS_Store" "$r:"
-    # verify
-    local left; left=$(dsstore_scan "$r" "$tmp")
-    [[ "$left" -eq 0 ]] && ok "deleted — $r: is clean" || die "$left still remain (check the rclone log)"
+    dsstore_delete "$r" "$n" "$log"
+    local drc=$?
+    [[ "$drc" == 130 ]] && info "cancelled — files already deleted stay deleted"
+    # verify by rescanning
+    if dsstore_scan "$r" "$tmp"; then
+      local left; left=$(count_lines "$tmp")
+      [[ "$left" -eq 0 ]] && ok "deleted — $r: is clean" || die "$left still remain"
+    fi
   else
     info "nothing deleted"
   fi
-  rm -f "$tmp"
+  rm -f "$tmp" "$log"
   pause
 }
 

@@ -70,9 +70,30 @@ Lists each remote with its state (`mounted / zombie / —`) and `[x] auto`. Acti
 Two-way sync with `rclone bisync`:
 - Browse the remote's folders (`rclone lsd`) and pick one.
 - The first run performs a `--resync` (baseline).
-- **Interval** of 1h or 30min (via launchd's `StartInterval`).
+- **Interval** of 5min, 10min, 15min, 30min or 1h (launchd's `StartInterval`),
+  plus `RunAtLoad` so it also syncs when the agent loads (login/reboot) instead
+  of waiting a whole interval.
 - Per pair: status (last sync, conflicts), sync now, dry-run, rebaseline,
-  disable (optionally deleting the local folder).
+  **change interval**, disable (optionally deleting the local folder).
+- Changing the interval rewrites the plist in the current format, so pairs
+  created by an older version are upgraded in place (they gain `RunAtLoad` and
+  `--min-age` too) rather than drifting from what new pairs get.
+
+**It is not realtime.** bisync is a batch job: it wakes up, lists both sides,
+transfers, and sleeps. Between runs it is blind — unlike the native Google Drive
+app, which keeps a local file watcher and a push connection to the API. Use a
+mount if you need live behaviour.
+
+**Large files.** A big file still being copied into the folder would be uploaded
+half-written and then re-uploaded whole on the next run. To avoid that, bisync
+runs with `--min-age 1m`: files touched in the last minute are skipped and picked
+up on the following run. The trade-off is a small delay — with a 5min interval,
+worst case is roughly 6min from save to cloud. Two more things worth knowing:
+launchd never runs two copies of the same job, so an upload that takes longer
+than the interval simply delays the next run instead of overlapping it; and a
+bisync interrupted mid-transfer (sleep, network drop, reboot) leaves the listings
+inconsistent and will demand a **rebaseline** — a longer transfer means a wider
+window for that to happen.
 
 ### Logs & files
 Per source (mount or bisync):
@@ -198,6 +219,12 @@ rclone delete --include ".DS_Store" gdrive-personal:                       # del
   restart.
 - **A bisync interrupted midway** requires `--resync` to rebuild the baseline —
   that is what the "rebaseline" action is for.
+- **`Empty prior Path1 listing. Cannot sync to an empty directory`** — this hits
+  when the baseline was taken while one side was still empty (e.g. you create the
+  pair, let it resync against an empty folder, and only then drop files in).
+  rclone refuses to proceed as a safeguard against mass deletion and demands a
+  `--resync`. "sync now" detects this and offers the rebaseline directly. To
+  avoid it: put the files in place *before* taking the baseline.
 - **launchd's PATH differs from the shell's** — hence the binary is hardcoded to
   `/opt/homebrew/bin/rclone` in the plists.
 - **Unloading a plist while its process runs**: unmount first.
