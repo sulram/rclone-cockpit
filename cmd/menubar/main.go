@@ -84,24 +84,40 @@ func menu() []menuet.MenuItem {
 	return items
 }
 
-// actions returns the submenu for a remote given its state.
+// actions returns the submenu for a remote: the mount action for its current
+// state, then a checkbox toggling auto-mount at login (the launchd plist).
 func actions(name string, st core.MountStatus) []menuet.MenuItem {
+	var items []menuet.MenuItem
 	switch st {
 	case core.Mounted:
-		return []menuet.MenuItem{
-			menuet.Regular{Text: "Unmount", Clicked: run(func() error { return client.Unmount(name) })},
-		}
+		items = append(items,
+			menuet.Regular{Text: "Unmount", Clicked: run(func() error { return client.Unmount(name) })})
 	case core.Zombie:
-		return []menuet.MenuItem{
+		items = append(items,
 			menuet.Regular{Text: "Repair (kill daemon + remount)",
 				Clicked: run(func() error { return client.Repair(name) })},
-			menuet.Regular{Text: "Unmount", Clicked: run(func() error { return client.Unmount(name) })},
-		}
+			menuet.Regular{Text: "Unmount", Clicked: run(func() error { return client.Unmount(name) })})
 	default:
-		return []menuet.MenuItem{
-			menuet.Regular{Text: "Mount", Clicked: run(func() error { return client.Mount(name) })},
-		}
+		items = append(items,
+			menuet.Regular{Text: "Mount", Clicked: run(func() error { return client.Mount(name) })})
 	}
+
+	// auto-mount at login — distinct from the app's own "Start at Login":
+	// this generates/removes the launchd plist that brings the MOUNT up on boot.
+	auto := client.HasAutostartMount(name)
+	items = append(items,
+		menuet.Separator{},
+		menuet.Regular{
+			Text:  "Mount at login",
+			State: auto, // checkmark when enabled
+			Clicked: run(func() error {
+				if auto {
+					return client.AutostartMountOff(name)
+				}
+				return client.AutostartMountOn(name)
+			}),
+		})
+	return items
 }
 
 // stateColor maps a mount state to a semantic (dark/light-adaptive) color.
