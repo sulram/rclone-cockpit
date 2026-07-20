@@ -274,15 +274,25 @@ autostart_mount_on() {
 </dict>
 </plist>
 EOF
-  # if a manual mount is already running, launchd can't mount on top of it
-  is_mounted "$r" && do_umount "$r" >/dev/null
-  launchctl_load "$p" && ok "autostart enabled" || die "launchctl complained"
+  # Only write the plist. launchd auto-loads a LaunchAgent at the next login and
+  # mounts it (RunAtLoad). We don't load it now: the daemon can't mount over a
+  # live manual mount, so loading would force an unmount/remount. This is a boot
+  # preference — it must not disturb the current mount. Use "mount" to mount now.
+  ok "autostart enabled (mounts at next login)"
 }
+
+# job actually loaded in launchd (only true after a login that auto-loaded it)
+autostart_loaded() { launchctl list "$(basename "$1" .plist)" >/dev/null 2>&1; }
 
 autostart_mount_off() {
   local r=$1 p; p=$(plist_mount "$r")
-  launchctl_unload "$p"
-  is_mounted "$r" && do_umount "$r" >/dev/null   # unmount before removing the plist
+  # Only boot out + unmount if the job is really loaded (from a prior login);
+  # booting it out would otherwise leave a zombie. If it was never loaded this
+  # session (the usual case), just remove the file and leave the mount alone.
+  if autostart_loaded "$p"; then
+    launchctl_unload "$p"
+    is_mounted "$r" && do_umount "$r" >/dev/null
+  fi
   rm -f "$p"
   ok "autostart disabled"
 }

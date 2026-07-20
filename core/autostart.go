@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 )
 
 // plistMountPath is the launchd plist for a remote's auto-mount.
@@ -63,9 +62,9 @@ func (c *Client) writeMountPlist(name string) error {
 	return os.WriteFile(c.plistMountPath(name), []byte(plist), 0o644)
 }
 
-// AutostartMountOn writes the plist and loads it, so the mount comes up at login
-// and is kept alive. A manual mount already running is dropped first, since
-// launchd cannot mount on top of it.
+// AutostartMountOn enables auto-mount at login by writing the launchd plist.
+// It deliberately does not mount now (see the comment inside): it is a boot
+// preference and must leave the current mount state alone.
 func (c *Client) AutostartMountOn(name string) error {
 	if err := os.MkdirAll(filepath.Join(c.Paths.MountRoot, name), 0o755); err != nil {
 		return err
@@ -73,32 +72,34 @@ func (c *Client) AutostartMountOn(name string) error {
 	if err := os.MkdirAll(c.Paths.Logs, 0o755); err != nil {
 		return err
 	}
-	if err := c.writeMountPlist(name); err != nil {
-		return err
-	}
-	if c.IsMounted(name) || c.hasDaemon(name) {
-		_ = c.Unmount(name)
-	}
-	if err := launchctlLoad(c.plistMountPath(name)); err != nil {
-		return err
-	}
-	// launchd starts the job asynchronously; wait for the mount to settle so
-	// callers don't observe the transient daemon-up-but-not-mounted state
-	// (which MountState would read as a zombie). KeepAlive keeps retrying
-	// regardless, so a slow mount is not an error.
-	for i := 0; i < 10 && !c.IsMounted(name); i++ {
-		time.Sleep(time.Second)
-	}
-	return nil
+	// Only write the plist. A LaunchAgent placed in ~/Library/LaunchAgents is
+	// loaded automatically at the next login, where RunAtLoad mounts it. We do
+	// NOT launchctl-load it now: the daemon can't mount over a live manual mount,
+	// so loading now would force an unmount/remount of whatever is mounted. This
+	// is a preference ("mount at login"), so it must not disturb the current
+	// mount. Use the Mount action to mount now.
+	return c.writeMountPlist(name)
 }
 
-// AutostartMountOff unloads the job, unmounts, and removes the plist.
+// AutostartMountOff removes the plist. If the launchd job is actually loaded
+// (from a previous login), it is booted out and the mount cleaned up, since
+// booting it out would otherwise leave the daemon's mount as a zombie. When the
+// job was never loaded this session (the common case, because On doesn't load
+// it), this only deletes the file and leaves the current mount untouched.
 func (c *Client) AutostartMountOff(name string) error {
-	launchctlUnload(c.mountLabel(name), c.plistMountPath(name))
-	if c.IsMounted(name) || c.hasDaemon(name) {
-		_ = c.Unmount(name)
+	if c.autostartLoaded(name) {
+		launchctlUnload(c.mountLabel(name), c.plistMountPath(name))
+		if c.IsMounted(name) || c.hasDaemon(name) {
+			_ = c.Unmount(name)
+		}
 	}
 	return os.Remove(c.plistMountPath(name))
+}
+
+// autostartLoaded reports whether the mount job is currently loaded in launchd
+// (`launchctl list <label>` exits 0 only when the job exists).
+func (c *Client) autostartLoaded(name string) bool {
+	return exec.Command("launchctl", "list", c.mountLabel(name)).Run() == nil
 }
 
 // launchctlLoad loads a plist, preferring the modern bootstrap over load.
