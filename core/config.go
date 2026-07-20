@@ -22,6 +22,7 @@ const (
 	pollInterval = "15s"
 	vfsCacheSize = "20G"
 	vfsCacheAge  = "72h"
+	nfsTimeo     = "600" // NFS client timeout, tenths of a second (60s)
 )
 
 // Paths resolves the fixed directories relative to the user's home.

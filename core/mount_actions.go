@@ -20,6 +20,12 @@ func (c *Client) mountArgs(name string) []string {
 		"--dir-cache-time", dirCacheTime,
 		"--attr-timeout", attrTimeout,
 		"--poll-interval", pollInterval,
+		// Raise the NFS client timeout from the macOS default of 1s (timeo=10,
+		// tenths of a second) to 60s. Below that, any rclone response slower
+		// than a second (a scan, a dangling shortcut, client_id throttling)
+		// makes macOS pop "Server connections interrupted". Verified applied
+		// via `nfsstat -m`.
+		"-o", "timeo=" + nfsTimeo,
 	}
 }
 

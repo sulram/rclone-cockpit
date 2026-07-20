@@ -234,11 +234,17 @@ rclone delete --include ".DS_Store" gdrive-personal:                       # del
   alive, the mount is gone from the mount table, and `~/Drives/<remote>` reads as
   an empty folder rather than erroring. No data is lost — but the mount really is
   down, so it is not merely cosmetic. Detected by the Mounts screen and fixed by
-  **repair** (kills the daemon, remounts). Larger `--dir-cache-time`,
-  `--attr-timeout` and `--poll-interval` reduce how often it happens; removing it
-  entirely would require macFUSE. Note that launchd's `KeepAlive` does **not**
-  cover this case: the process never dies, so there is nothing for launchd to
-  restart.
+  **repair** (kills the daemon, remounts). Note that launchd's `KeepAlive` does
+  **not** cover this case: the process never dies, so there is nothing for
+  launchd to restart.
+  The main driver is the NFS client timeout: macOS mounts with `timeo=10` (1s,
+  in tenths of a second — check with `nfsstat -m`), so any rclone response
+  slower than a second trips the popup. Mounts are made with `-o timeo=600`
+  (60s), which all but eliminates the "interrupted during a slow operation"
+  case. Larger `--dir-cache-time` / `--attr-timeout` / `--poll-interval` help
+  too. What remains is the genuine "the daemon went away" popup (on unmount,
+  crash, or sleep) — there the server really is gone, and only macFUSE would
+  avoid NFS entirely.
 - **A bisync interrupted midway** requires `--resync` to rebuild the baseline —
   that is what the "rebaseline" action is for.
 - **`Empty prior Path1 listing. Cannot sync to an empty directory`** — this hits

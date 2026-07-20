@@ -25,6 +25,10 @@ VFS_CACHE_MAX_AGE="72h"
 DIR_CACHE_TIME="1000h"
 ATTR_TIMEOUT="5s"
 POLL_INTERVAL="15s"
+# NFS client timeout in tenths of a second (60s). The macOS default is 1s
+# (timeo=10); below ~60s any rclone response slower than that pops "Server
+# connections interrupted". Verified applied via `nfsstat -m`.
+NFS_TIMEO="600"
 
 # macOS junk that must not be pushed to the Drive by bisyncs (the local folder
 # is a local disk, so DSDontWriteNetworkStores doesn't cover it — filter it here)
@@ -200,7 +204,8 @@ mount_args() {
 --vfs-cache-max-age $VFS_CACHE_MAX_AGE \
 --dir-cache-time $DIR_CACHE_TIME \
 --attr-timeout $ATTR_TIMEOUT \
---poll-interval $POLL_INTERVAL"
+--poll-interval $POLL_INTERVAL \
+-o timeo=$NFS_TIMEO"
 }
 
 do_mount() {
@@ -251,6 +256,7 @@ autostart_mount_on() {
     <string>--dir-cache-time</string><string>${DIR_CACHE_TIME}</string>
     <string>--attr-timeout</string><string>${ATTR_TIMEOUT}</string>
     <string>--poll-interval</string><string>${POLL_INTERVAL}</string>
+    <string>-o</string><string>timeo=${NFS_TIMEO}</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
