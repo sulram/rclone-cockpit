@@ -1,6 +1,6 @@
 // Command menubar is the macOS status-bar front-end for rclone-cockpit.
-// This is the v1 walking skeleton: it renders live remote state from the shared
-// core package. Actions (mount/unmount/sync) come next.
+// It renders live remote state from the shared core package and exposes the
+// mount actions as clickable menu items.
 package main
 
 import (
@@ -13,7 +13,25 @@ import (
 
 var client = core.New()
 
-// title reflects the overall state in the menu bar: cloud icon plus a count,
+// refresh repaints the menu-bar title and the open dropdown.
+func refresh() {
+	menuet.App().SetMenuState(title())
+	menuet.App().MenuChanged()
+}
+
+// run executes a blocking core action off the UI thread, then refreshes.
+// Actions like Mount wait up to ~10s, so they must not run on the AppKit
+// run loop or the menu would freeze.
+func run(action func() error) func() {
+	return func() {
+		go func() {
+			_ = action()
+			refresh()
+		}()
+	}
+}
+
+// title reflects overall state in the menu bar: cloud icon plus mounted count,
 // turning warning-colored if any remote is in the zombie state.
 func title() *menuet.MenuState {
 	remotes, err := client.ListRemotes()
@@ -38,7 +56,8 @@ func title() *menuet.MenuState {
 	return &menuet.MenuState{Title: fmt.Sprintf("☁️ %d", mounted)}
 }
 
-// menu builds the dropdown: one row per remote, showing its state.
+// menu builds the dropdown: one row per remote, each opening a submenu with the
+// action appropriate to its current state.
 func menu() []menuet.MenuItem {
 	items := []menuet.MenuItem{
 		menuet.Regular{Text: "rclone cockpit", FontWeight: menuet.WeightBold},
@@ -52,13 +71,37 @@ func menu() []menuet.MenuItem {
 		return append(items, menuet.Regular{Text: "no remotes configured"})
 	}
 	for _, r := range remotes {
-		st := client.MountState(r.Name)
-		items = append(items, menuet.Regular{Runs: []menuet.TextRun{
-			{Text: r.Name + "  "},
-			{Text: st.String(), Color: stateColor(st)},
-		}})
+		name := r.Name
+		st := client.MountState(name)
+		items = append(items, menuet.Regular{
+			Runs: []menuet.TextRun{
+				{Text: name + "  "},
+				{Text: st.String(), Color: stateColor(st)},
+			},
+			Children: func() []menuet.MenuItem { return actions(name, st) },
+		})
 	}
 	return items
+}
+
+// actions returns the submenu for a remote given its state.
+func actions(name string, st core.MountStatus) []menuet.MenuItem {
+	switch st {
+	case core.Mounted:
+		return []menuet.MenuItem{
+			menuet.Regular{Text: "Unmount", Clicked: run(func() error { return client.Unmount(name) })},
+		}
+	case core.Zombie:
+		return []menuet.MenuItem{
+			menuet.Regular{Text: "Repair (kill daemon + remount)",
+				Clicked: run(func() error { return client.Repair(name) })},
+			menuet.Regular{Text: "Unmount", Clicked: run(func() error { return client.Unmount(name) })},
+		}
+	default:
+		return []menuet.MenuItem{
+			menuet.Regular{Text: "Mount", Clicked: run(func() error { return client.Mount(name) })},
+		}
+	}
 }
 
 // stateColor maps a mount state to a semantic (dark/light-adaptive) color.
@@ -79,11 +122,10 @@ func main() {
 	app.Label = "com.marlus.rclone-cockpit"
 	app.Children = menu
 
-	// refresh the bar + menu every few seconds so state stays live
+	// keep state live even when nobody clicks (e.g. a mount goes zombie)
 	go func() {
 		for {
-			app.SetMenuState(title())
-			app.MenuChanged()
+			refresh()
 			time.Sleep(5 * time.Second)
 		}
 	}()
