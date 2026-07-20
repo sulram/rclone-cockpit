@@ -81,6 +81,7 @@ func menu() []menuet.MenuItem {
 			Children: func() []menuet.MenuItem { return actions(name, st) },
 		})
 	}
+	items = append(items, bisyncItems()...)
 	return items
 }
 
@@ -107,6 +108,8 @@ func actions(name string, st core.MountStatus) []menuet.MenuItem {
 	auto := client.HasAutostartMount(name)
 	items = append(items,
 		menuet.Separator{},
+		menuet.Regular{Text: "Open in Finder",
+			Clicked: run(func() error { return client.Open(client.MountPath(name)) })},
 		menuet.Regular{
 			Text:  "Mount at login",
 			State: auto, // checkmark when enabled
@@ -118,6 +121,66 @@ func actions(name string, st core.MountStatus) []menuet.MenuItem {
 			}),
 		})
 	return items
+}
+
+// bisyncItems renders the "Bidirectional" section: one row per pair, each with
+// a submenu to sync now, rebaseline, and open the local folder.
+func bisyncItems() []menuet.MenuItem {
+	pairs := client.BisyncPairs()
+	if len(pairs) == 0 {
+		return nil
+	}
+	items := []menuet.MenuItem{
+		menuet.Separator{},
+		menuet.Regular{Text: "Bidirectional", FontWeight: menuet.WeightBold, Color: menuet.LabelSecondary},
+	}
+	for _, p := range pairs {
+		pair := p
+		items = append(items, menuet.Regular{
+			Runs: []menuet.TextRun{
+				{Text: pair.Name + "  "},
+				{Text: everyLabel(pair.IntervalSec), Color: menuet.LabelSecondary},
+			},
+			Children: func() []menuet.MenuItem { return bisyncActions(pair) },
+		})
+	}
+	return items
+}
+
+func bisyncActions(p core.BisyncPair) []menuet.MenuItem {
+	last := "never"
+	if t := client.LastSync(p.Name); !t.IsZero() {
+		last = t.Format("Jan 2, 15:04")
+	}
+	return []menuet.MenuItem{
+		menuet.Regular{Text: p.Remote, Color: menuet.LabelSecondary},
+		menuet.Regular{Text: "last sync: " + last, Color: menuet.LabelSecondary},
+		menuet.Separator{},
+		menuet.Regular{Text: "Sync now", Clicked: run(func() error {
+			_, err := client.SyncNow(p.Name)
+			return err
+		})},
+		menuet.Regular{Text: "Rebaseline (--resync)", Clicked: run(func() error { return client.Resync(p.Name) })},
+		menuet.Regular{Text: "Open folder in Finder", Clicked: run(func() error { return client.Open(p.Local) })},
+	}
+}
+
+// everyLabel turns an interval in seconds into a short label.
+func everyLabel(sec int) string {
+	switch sec {
+	case 300:
+		return "every 5min"
+	case 600:
+		return "every 10min"
+	case 900:
+		return "every 15min"
+	case 1800:
+		return "every 30min"
+	case 3600:
+		return "every 1h"
+	default:
+		return fmt.Sprintf("every %ds", sec)
+	}
 }
 
 // stateColor maps a mount state to a semantic (dark/light-adaptive) color.
