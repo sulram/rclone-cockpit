@@ -29,6 +29,9 @@ POLL_INTERVAL="15s"
 # (timeo=10); below ~60s any rclone response slower than that pops "Server
 # connections interrupted". Verified applied via `nfsstat -m`.
 NFS_TIMEO="600"
+# log rotation (rclone-native): cap each log, keep a few gzipped backups
+LOG_MAX_SIZE="10M"
+LOG_MAX_BACKUPS="3"
 
 # macOS junk that must not be pushed to the Drive by bisyncs (the local folder
 # is a local disk, so DSDontWriteNetworkStores doesn't cover it — filter it here)
@@ -205,14 +208,18 @@ mount_args() {
 --dir-cache-time $DIR_CACHE_TIME \
 --attr-timeout $ATTR_TIMEOUT \
 --poll-interval $POLL_INTERVAL \
--o timeo=$NFS_TIMEO"
+-o timeo=$NFS_TIMEO \
+--log-file $LOGS/mount-$r.log \
+--log-file-max-size $LOG_MAX_SIZE \
+--log-file-max-backups $LOG_MAX_BACKUPS \
+--log-file-compress"
 }
 
 do_mount() {
   local r=$1
   mkdir -p "$MOUNT_ROOT/$r"
   # shellcheck disable=SC2046
-  if ! "$RCLONE" $(mount_args "$r") --daemon --log-file "$LOGS/mount-$r.log"; then
+  if ! "$RCLONE" $(mount_args "$r") --daemon; then   # --log-file is in mount_args
     die "failed to start the daemon (log: $LOGS/mount-$r.log)"; return 1
   fi
   # NFS server + OAuth can take a few seconds to show up in the mount table
@@ -257,11 +264,13 @@ autostart_mount_on() {
     <string>--attr-timeout</string><string>${ATTR_TIMEOUT}</string>
     <string>--poll-interval</string><string>${POLL_INTERVAL}</string>
     <string>-o</string><string>timeo=${NFS_TIMEO}</string>
+    <string>--log-file</string><string>${LOGS}/mount-${r}.log</string>
+    <string>--log-file-max-size</string><string>${LOG_MAX_SIZE}</string>
+    <string>--log-file-max-backups</string><string>${LOG_MAX_BACKUPS}</string>
+    <string>--log-file-compress</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>${LOGS}/mount-${r}.log</string>
-  <key>StandardErrorPath</key><string>${LOGS}/mount-${r}.log</string>
 </dict>
 </plist>
 EOF
@@ -404,6 +413,9 @@ bisync_write_plist() {
     <string>--conflict-loser</string><string>pathname</string>
     <string>--min-age</string><string>${BISYNC_MIN_AGE}</string>
 ${junk_xml}    <string>--log-file</string><string>${LOGS}/bisync-${pair}.log</string>
+    <string>--log-file-max-size</string><string>${LOG_MAX_SIZE}</string>
+    <string>--log-file-max-backups</string><string>${LOG_MAX_BACKUPS}</string>
+    <string>--log-file-compress</string>
     <string>--log-level</string><string>INFO</string>
   </array>
   <key>StartInterval</key><integer>${secs}</integer>

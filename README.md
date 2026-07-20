@@ -124,6 +124,12 @@ Per source (mount or bisync):
 - **On-disk files** — what is materialized locally, with size and date (for a
   bisync = `~/sync/<pair>`; for a mount = the downloaded VFS cache).
 
+Logs are rotated by rclone itself (`--log-file-max-size 10M`,
+`--log-file-max-backups 3`, `--log-file-compress`), so a 24/7 mount does not grow
+its log without bound — each service is capped at ~10M plus a few gzipped
+backups. Rotation only works via `--log-file`, so mounts log there rather than
+through launchd's `StandardOutPath`.
+
 ### Cache
 `du -sh` of the VFS cache per remote, plus a clear action.
 

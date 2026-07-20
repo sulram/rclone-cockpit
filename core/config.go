@@ -23,6 +23,10 @@ const (
 	vfsCacheSize = "20G"
 	vfsCacheAge  = "72h"
 	nfsTimeo     = "600" // NFS client timeout, tenths of a second (60s)
+	// log rotation (rclone-native): cap each log and keep a few gzipped backups
+	// so logs don't grow forever on a 24/7 app.
+	logMaxSize    = "10M"
+	logMaxBackups = "3"
 )
 
 // Paths resolves the fixed directories relative to the user's home.

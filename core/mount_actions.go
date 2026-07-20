@@ -26,6 +26,12 @@ func (c *Client) mountArgs(name string) []string {
 		// makes macOS pop "Server connections interrupted". Verified applied
 		// via `nfsstat -m`.
 		"-o", "timeo=" + nfsTimeo,
+		// Log to a rotated file here (not via --daemon/launchd stdout) so the
+		// same rotation applies to a manual mount and to the autostart plist.
+		"--log-file", c.mountLogPath(name),
+		"--log-file-max-size", logMaxSize,
+		"--log-file-max-backups", logMaxBackups,
+		"--log-file-compress",
 	}
 }
 
@@ -43,7 +49,7 @@ func (c *Client) Mount(name string) error {
 	if err := os.MkdirAll(c.Paths.Logs, 0o755); err != nil {
 		return err
 	}
-	args := append(c.mountArgs(name), "--daemon", "--log-file", c.mountLogPath(name))
+	args := append(c.mountArgs(name), "--daemon") // --log-file is already in mountArgs
 	if err := exec.Command(c.bin, args...).Run(); err != nil {
 		return fmt.Errorf("start daemon: %w (see %s)", err, c.mountLogPath(name))
 	}
