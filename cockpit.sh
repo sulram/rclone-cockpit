@@ -222,7 +222,12 @@ do_mount() {
 do_umount() {
   local r=$1
   umount "$MOUNT_ROOT/$r" 2>/dev/null || diskutil unmount force "$MOUNT_ROOT/$r" >/dev/null 2>&1
-  is_mounted "$r" && die "still mounted" || ok "unmounted"
+  is_mounted "$r" && { die "still mounted"; return 1; }
+  # the nfsmount daemon does NOT exit on umount — it keeps serving NFS with no
+  # mount, i.e. a zombie. Kill it so the remote ends up truly unmounted.
+  pkill -f "nfsmount $r:" 2>/dev/null
+  local i; for i in 1 2 3 4 5 6; do has_daemon "$r" || break; sleep 0.5; done
+  has_daemon "$r" && die "unmounted but daemon did not die" || ok "unmounted"
 }
 
 autostart_mount_on() {
