@@ -44,10 +44,13 @@ cannot see.
 
 - macOS 14+ (Apple Silicon) — mounts use the **native NFS server, no macFUSE**
 - [Homebrew](https://brew.sh)
-- rclone 1.68+ · gum (v0) · Go 1.22+ and Xcode Command Line Tools (v1, cgo)
+- rclone 1.68+ · gum (v0)
+- For v1: the Go toolchain (managed with [mise](https://mise.jdx.dev)) and the
+  Xcode Command Line Tools (cgo). The Go version is pinned in `mise.toml`.
 
 ```bash
 brew install rclone gum
+mise install          # installs the Go version pinned in mise.toml (v1 only)
 ```
 
 ## Running
